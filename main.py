@@ -1,12 +1,14 @@
-from flask import Flask, request, Response
-from flask_cors import CORS
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 import requests
 import json
-import subprocess
 import google.auth
 import google.auth.exceptions
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request as GoogleRequest
 import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("uvicorn")
 
 
 def get_current_project():
@@ -21,73 +23,70 @@ def get_current_project():
         raise Exception(f"Error obtaining default credentials: {str(ex)}")
 
 
-def create_app():
-    app = Flask(__name__)
-    CORS(app)
+app = FastAPI()
 
-    # Configure logging
-    logging.basicConfig(level=logging.INFO)
-    logger = app.logger
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    @app.route("/<path:path>", methods=["GET", "POST", "OPTIONS"])
-    def proxy(path):
-        # Extract the first element of the path
-        path_parts = path.split("/", 1)
-        if path_parts[0] == "api":
-            project_id = get_current_project()
-            api_path = path
-        else:
-            project_id = path_parts[0]
-            api_path = path_parts[1] if len(path_parts) > 1 else ""
 
-        # Log the project ID
-        logger.info(f"Using Project ID: {project_id}")
+@app.api_route("/{path:path}", methods=["GET", "POST", "OPTIONS"])
+async def proxy(path: str, request: Request):
+    path_parts = path.split("/", 1)
+    if path_parts[0] == "api":
+        project_id = get_current_project()
+        api_path = path
+    else:
+        project_id = path_parts[0]
+        api_path = path_parts[1] if len(path_parts) > 1 else ""
 
-        GOOGLE_PROM_URL = f"https://monitoring.googleapis.com/v1/projects/{project_id}/location/global/prometheus"
+    logger.info(f"Using Project ID: {project_id}")
 
-        # Ensure the credentials are valid
-        credentials, _ = google.auth.default()
-        credentials.refresh(Request())
+    GOOGLE_PROM_URL = f"https://monitoring.googleapis.com/v1/projects/{project_id}/location/global/prometheus"
 
-        headers = {
-            "Authorization": f"Bearer {credentials.token}",
-            "Content-Type": "application/json",
-        }
+    credentials, _ = google.auth.default()
+    credentials.refresh(GoogleRequest())
 
-        # Filter out unsupported parameters
-        params = {k: v for k, v in request.args.items() if k not in ["refresh"]}
+    headers = {
+        "Authorization": f"Bearer {credentials.token}",
+        "Content-Type": "application/json",
+    }
 
-        if request.method == "GET":
-            resp = requests.get(
-                f"{GOOGLE_PROM_URL}/{api_path}", headers=headers, params=params
-            )
-        elif request.method == "POST":
-            # Parse the request body
-            data = json.loads(request.data)
-            # Remove unsupported fields
-            if "refresh" in data:
-                del data["refresh"]
-            resp = requests.post(
-                f"{GOOGLE_PROM_URL}/{api_path}", headers=headers, json=data
-            )
+    params = {k: v for k, v in request.query_params.items() if k != "refresh"}
 
-        excluded_headers = [
-            "content-encoding",
-            "content-length",
-            "transfer-encoding",
-            "connection",
-        ]
-        headers = [
-            (name, value)
-            for (name, value) in resp.raw.headers.items()
-            if name.lower() not in excluded_headers
-        ]
+    if request.method == "GET":
+        resp = requests.get(
+            f"{GOOGLE_PROM_URL}/{api_path}", headers=headers, params=params
+        )
+    elif request.method == "POST":
+        data = await request.json()
+        data.pop("refresh", None)
+        resp = requests.post(
+            f"{GOOGLE_PROM_URL}/{api_path}", headers=headers, json=data
+        )
 
-        return Response(resp.content, resp.status_code, headers)
+    excluded_headers = [
+        "content-encoding",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+    ]
+    headers = [
+        (name, value)
+        for (name, value) in resp.raw.headers.items()
+        if name.lower() not in excluded_headers
+    ]
 
-    return app
+    return Response(
+        content=resp.content, status_code=resp.status_code, headers=dict(headers)
+    )
 
 
 if __name__ == "__main__":
-    app = create_app()
-    app.run(port=8082)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8082)
