@@ -1,0 +1,8 @@
+services:
+  promlens:
+    image: prom/promlens
+    container_name: promlens
+    ports:
+      - 8080:8080
+    command: --web.default-prometheus-url="http://127.0.0.1:8082"
+
